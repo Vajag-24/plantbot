@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN", "8748512036:AAFIJZHmN_rwie1Pd7iUwWp-RiphzJkwcHc")
+TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
 
 bot = Bot(token=TOKEN)
