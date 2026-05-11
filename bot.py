@@ -209,7 +209,7 @@ def back_kb():
     return kb.as_markup()
 
 # ─── State for adding plants ──────────────────────────────────────
-add_state = {}  # chat_id -> step data
+add_state = {}  # (chat_id, user_id) -> step data
 
 # ─── Status text ─────────────────────────────────────────────────
 def build_status_text(plants, title="🌿 *Мои растения*"):
@@ -369,7 +369,8 @@ async def cb_do_delete(cb: CallbackQuery):
 # ─── Add plant flow ───────────────────────────────────────────────
 @dp.callback_query(F.data == "action:add")
 async def cb_add_start(cb: CallbackQuery):
-    add_state[cb.message.chat.id] = {"step": "name", "msg_id": cb.message.message_id}
+    key = (cb.message.chat.id, cb.from_user.id)
+    add_state[key] = {"step": "name", "chat_id": cb.message.chat.id}
     await cb.message.edit_text(
         "➕ *Добавляем растение*\n\nШаг 1/4: Напиши *название* растения",
         parse_mode="Markdown"
@@ -378,11 +379,12 @@ async def cb_add_start(cb: CallbackQuery):
 
 @dp.message(F.text)
 async def handle_text(msg: types.Message):
-    chat_id = msg.chat.id
-    state = add_state.get(chat_id)
+    key = (msg.chat.id, msg.from_user.id)
+    state = add_state.get(key)
     if not state:
         return
 
+    chat_id = state["chat_id"]
     step = state["step"]
 
     if step == "name":
@@ -425,7 +427,7 @@ async def handle_text(msg: types.Message):
         method = state["method"]
 
         add_plant(chat_id, name, emoji, interval, method, tip)
-        del add_state[chat_id]
+        del add_state[key]
 
         plants = get_plants(chat_id)
         text = build_status_text(plants)
