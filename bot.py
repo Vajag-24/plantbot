@@ -64,6 +64,21 @@ async def init_db():
                 watered_at TEXT NOT NULL
             )
         """)
+        # незаконченный мастер добавления растения — в БД, а не в памяти,
+        # иначе рестарт контейнера обрывает его на полушаге
+        await con.execute("""
+            CREATE TABLE IF NOT EXISTS add_state (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                step TEXT NOT NULL,
+                name TEXT,
+                emoji TEXT,
+                interval_days INTEGER,
+                method TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """)
 
 async def register_chat(chat_id):
     async with pool.acquire() as con:
@@ -128,6 +143,41 @@ async def get_stats(chat_id):
                FROM plants p LEFT JOIN history h ON p.id=h.plant_id
                WHERE p.chat_id=$1 GROUP BY p.id, p.emoji, p.name ORDER BY cnt DESC""",
             chat_id
+        )
+
+ADD_STATE_TTL = "1 day"  # брошенный мастер добавления не висит вечно
+
+async def get_add_state(chat_id, user_id):
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
+            f"""SELECT step, name, emoji, interval_days, method FROM add_state
+                WHERE chat_id=$1 AND user_id=$2
+                  AND updated_at > now() - interval '{ADD_STATE_TTL}'""",
+            chat_id, user_id
+        )
+        return dict(row) if row else None
+
+async def save_add_state(chat_id, user_id, st):
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO add_state(chat_id, user_id, step, name, emoji, interval_days, method, updated_at)
+               VALUES($1,$2,$3,$4,$5,$6,$7, now())
+               ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                   step=EXCLUDED.step, name=EXCLUDED.name, emoji=EXCLUDED.emoji,
+                   interval_days=EXCLUDED.interval_days, method=EXCLUDED.method,
+                   updated_at=now()""",
+            chat_id, user_id, st["step"], st.get("name"), st.get("emoji"),
+            st.get("interval_days"), st.get("method")
+        )
+
+async def clear_add_state(chat_id, user_id):
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM add_state WHERE chat_id=$1 AND user_id=$2", chat_id, user_id)
+
+async def purge_stale_add_state():
+    async with pool.acquire() as con:
+        await con.execute(
+            f"DELETE FROM add_state WHERE updated_at <= now() - interval '{ADD_STATE_TTL}'"
         )
 
 async def get_all_chats():
@@ -262,15 +312,11 @@ def build_status_text(plants, title="🌿 *Мои растения*"):
         lines.append(f"   _{st}_ · последний: {last_str}")
     return "\n".join(lines)
 
-# ─── Add state ────────────────────────────────────────────────────
-add_state = {}  # (chat_id, user_id) -> step data
-
 # ─── Handlers ─────────────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await register_chat(msg.chat.id)
-    key = (msg.chat.id, msg.from_user.id)
-    add_state.pop(key, None)
+    await clear_add_state(msg.chat.id, msg.from_user.id)
     plants = await get_plants(msg.chat.id)
     text = build_status_text(plants, "🌿 *Привет! Я трекер полива*\n\nВот ваши растения:")
     await msg.answer(text, parse_mode="Markdown", reply_markup=main_kb())
@@ -278,8 +324,7 @@ async def cmd_start(msg: types.Message):
 @dp.message(Command("menu"))
 async def cmd_menu(msg: types.Message):
     await register_chat(msg.chat.id)
-    key = (msg.chat.id, msg.from_user.id)
-    add_state.pop(key, None)
+    await clear_add_state(msg.chat.id, msg.from_user.id)
     plants = await get_plants(msg.chat.id)
     text = build_status_text(plants)
     await msg.answer(text, parse_mode="Markdown", reply_markup=main_kb())
@@ -403,48 +448,51 @@ async def cb_do_delete(cb: CallbackQuery):
 @dp.callback_query(F.data == "action:add")
 async def cb_add_start(cb: CallbackQuery):
     await ack(cb)
-    key = (cb.message.chat.id, cb.from_user.id)
-    add_state[key] = {"step": "name", "chat_id": cb.message.chat.id}
+    await save_add_state(cb.message.chat.id, cb.from_user.id, {"step": "name"})
     await safe_edit(cb, "➕ *Добавляем растение*\n\nШаг 1/4: Напиши *название* растения")
 
 @dp.message(F.text)
 async def handle_text(msg: types.Message):
-    key = (msg.chat.id, msg.from_user.id)
-    state = add_state.get(key)
-    if not state:
+    chat_id, user_id = msg.chat.id, msg.from_user.id
+    st = await get_add_state(chat_id, user_id)
+    if not st:
         return
-    chat_id = state["chat_id"]
-    step = state["step"]
+    step = st["step"]
+    text = msg.text.strip()
 
     if step == "name":
-        state["name"] = msg.text.strip()
-        state["step"] = "emoji"
+        st["name"] = text
+        st["step"] = "emoji"
+        await save_add_state(chat_id, user_id, st)
         await msg.answer("Шаг 2/4: Отправь *эмодзи* (например 🌴 🌵 🌿 🌾 🌺 🪴)", parse_mode="Markdown")
     elif step == "emoji":
-        state["emoji"] = msg.text.strip()[:2] or "🌱"
-        state["step"] = "interval"
+        st["emoji"] = text[:2] or "🌱"
+        st["step"] = "interval"
+        await save_add_state(chat_id, user_id, st)
         await msg.answer("Шаг 3/4: Каждые сколько *дней* поливать?", parse_mode="Markdown")
     elif step == "interval":
         try:
-            days = int(msg.text.strip())
+            days = int(text)
             if days < 1 or days > 365: raise ValueError
         except ValueError:
             await msg.answer("Введи число от 1 до 365")
             return
-        state["interval"] = days
-        state["step"] = "method"
+        st["interval_days"] = days
+        st["step"] = "method"
+        await save_add_state(chat_id, user_id, st)
         await msg.answer("Шаг 4/4: *Способ полива* (или `-` пропустить)", parse_mode="Markdown")
     elif step == "method":
-        state["method"] = "" if msg.text.strip() == "-" else msg.text.strip()
-        state["step"] = "tip"
+        st["method"] = "" if text == "-" else text
+        st["step"] = "tip"
+        await save_add_state(chat_id, user_id, st)
         await msg.answer("*Заметка/совет* (или `-` пропустить)", parse_mode="Markdown")
     elif step == "tip":
-        tip = "" if msg.text.strip() == "-" else msg.text.strip()
-        await add_plant(chat_id, state["name"], state["emoji"], state["interval"], state["method"], tip)
-        del add_state[key]
+        tip = "" if text == "-" else text
+        await add_plant(chat_id, st["name"], st["emoji"], st["interval_days"], st["method"], tip)
+        await clear_add_state(chat_id, user_id)
         plants = await get_plants(chat_id)
         await msg.answer(
-            f"✅ {state['emoji']} *{state['name']}* добавлен!\n\n{build_status_text(plants)}",
+            f"✅ {st['emoji']} *{st['name']}* добавлен!\n\n{build_status_text(plants)}",
             parse_mode="Markdown", reply_markup=main_kb()
         )
 
@@ -463,6 +511,10 @@ async def on_error(event: ErrorEvent):
 
 # ─── Daily reminder ───────────────────────────────────────────────
 async def daily_check():
+    try:
+        await purge_stale_add_state()
+    except Exception as e:
+        logging.warning(f"daily_check: не смог почистить add_state: {e}")
     try:
         chats = await get_all_chats()
     except Exception as e:
