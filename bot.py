@@ -5,7 +5,8 @@ from datetime import date, timedelta
 import asyncpg
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery
+from aiogram.types import CallbackQuery, InaccessibleMessage, ErrorEvent
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -13,6 +14,11 @@ logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в переменных окружения")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан в переменных окружения")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -22,7 +28,15 @@ pool = None
 # ─── Database ─────────────────────────────────────────────────────
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+    # max_inactive_connection_lifetime — чтобы после рестарта Postgres
+    # в пуле не оставались мёртвые соединения
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=15,
+        max_inactive_connection_lifetime=300,
+    )
     async with pool.acquire() as con:
         await con.execute("""
             CREATE TABLE IF NOT EXISTS chats (
@@ -122,6 +136,13 @@ async def get_all_chats():
         return [r['chat_id'] for r in rows]
 
 # ─── Helpers ──────────────────────────────────────────────────────
+MONTHS_SHORT = ["янв", "фев", "мар", "апр", "мая", "июн",
+                "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+def fmt_day(d: date) -> str:
+    # "%-d %b" — расширение glibc, падает на Windows и musl; собираем вручную
+    return f"{d.day} {MONTHS_SHORT[d.month - 1]}"
+
 def days_until_next(last_watered, interval_days):
     if not last_watered:
         return None
@@ -191,6 +212,42 @@ def confirm_delete_kb(plant_id):
     kb.adjust(2)
     return kb.as_markup()
 
+# ─── Callback helpers ─────────────────────────────────────────────
+async def ack(cb: CallbackQuery, text: str = None, alert: bool = False):
+    """Снять «часики» с кнопки. Вызывать как можно раньше и никогда не падать."""
+    try:
+        await cb.answer(text, show_alert=alert)
+    except TelegramBadRequest as e:
+        # query is too old / already answered — кнопка всё равно разблокируется
+        logging.info(f"answer_callback_query: {e}")
+
+async def safe_edit(cb: CallbackQuery, text: str, reply_markup=None):
+    """Отредактировать сообщение, а если нельзя — прислать новое.
+
+    edit_text не работает в трёх случаях, и каждый из них раньше молча
+    убивал обработчик:
+      - сообщение старше 48 ч: Telegram отдаёт InaccessibleMessage без edit_text
+      - текст не изменился: 400 message is not modified
+      - сообщение удалено пользователем
+    """
+    msg = cb.message
+    if msg is None:
+        return
+    chat_id = msg.chat.id
+
+    if isinstance(msg, InaccessibleMessage):
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+        return
+
+    try:
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        low = str(e).lower()
+        if "message is not modified" in low:
+            return
+        logging.info(f"edit_text не удался ({e}), отправляю новое сообщение")
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+
 # ─── Status text ──────────────────────────────────────────────────
 def build_status_text(plants, title="🌿 *Мои растения*"):
     if not plants:
@@ -200,7 +257,7 @@ def build_status_text(plants, title="🌿 *Мои растения*"):
         days = days_until_next(p['last_watered'], p['interval_days'])
         se = status_emoji(days)
         st = format_status(days)
-        last_str = date.fromisoformat(p['last_watered']).strftime("%-d %b").lower() if p['last_watered'] else "—"
+        last_str = fmt_day(date.fromisoformat(p['last_watered'])) if p['last_watered'] else "—"
         lines.append(f"{se} {p['emoji']} *{p['name']}*")
         lines.append(f"   _{st}_ · последний: {last_str}")
     return "\n".join(lines)
@@ -229,44 +286,42 @@ async def cmd_menu(msg: types.Message):
 
 @dp.callback_query(F.data == "action:menu")
 async def cb_menu(cb: CallbackQuery):
+    await ack(cb)
     plants = await get_plants(cb.message.chat.id)
-    text = build_status_text(plants)
-    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=main_kb())
-    await cb.answer()
+    await safe_edit(cb, build_status_text(plants), main_kb())
 
 @dp.callback_query(F.data == "action:status")
 async def cb_status(cb: CallbackQuery):
+    await ack(cb)
     plants = await get_plants(cb.message.chat.id)
-    text = build_status_text(plants)
-    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=main_kb())
-    await cb.answer()
+    await safe_edit(cb, build_status_text(plants), main_kb())
 
 @dp.callback_query(F.data == "action:water")
 async def cb_water_list(cb: CallbackQuery):
     plants = await get_plants(cb.message.chat.id)
     if not plants:
-        await cb.answer("Нет растений!", show_alert=True)
+        await ack(cb, "Нет растений!", alert=True)
         return
-    await cb.message.edit_text("💧 *Выбери что полить:*", parse_mode="Markdown", reply_markup=plants_water_kb(plants))
-    await cb.answer()
+    await ack(cb)
+    await safe_edit(cb, "💧 *Выбери что полить:*", plants_water_kb(plants))
 
 @dp.callback_query(F.data.startswith("water:"))
 async def cb_do_water(cb: CallbackQuery):
     plant_id = int(cb.data.split(":")[1])
     plant = await get_plant(plant_id)
     if not plant:
-        await cb.answer("Не найдено", show_alert=True)
+        await ack(cb, "Не найдено", alert=True)
         return
     days = days_until_next(plant['last_watered'], plant['interval_days'])
     if not can_water(days):
-        await cb.answer(f"Рано! {format_status(days)}", show_alert=True)
+        await ack(cb, f"Рано! {format_status(days)}", alert=True)
         return
     username = cb.from_user.full_name or cb.from_user.username or "кто-то"
     await water_plant(plant_id, username)
+    await ack(cb, f"✅ {plant['emoji']} {plant['name']} полит!")
     plants = await get_plants(cb.message.chat.id)
-    await cb.message.edit_text(build_status_text(plants), parse_mode="Markdown", reply_markup=main_kb())
-    await cb.answer(f"✅ {plant['emoji']} {plant['name']} полит!")
-    next_date = (date.today() + timedelta(days=plant['interval_days'])).strftime("%-d %b")
+    await safe_edit(cb, build_status_text(plants), main_kb())
+    next_date = fmt_day(date.today() + timedelta(days=plant['interval_days']))
     await bot.send_message(
         cb.message.chat.id,
         f"💧 *{username}* полил {plant['emoji']} *{plant['name']}*\nСледующий полив: {next_date}",
@@ -277,26 +332,29 @@ async def cb_do_water(cb: CallbackQuery):
 async def cb_skip(cb: CallbackQuery):
     plant_id = int(cb.data.split(":")[1])
     plant = await get_plant(plant_id)
-    if plant:
-        days = days_until_next(plant['last_watered'], plant['interval_days'])
-        await cb.answer(f"Рано! {format_status(days)}", show_alert=True)
+    if not plant:
+        await ack(cb, "Не найдено", alert=True)
+        return
+    days = days_until_next(plant['last_watered'], plant['interval_days'])
+    await ack(cb, f"Рано! {format_status(days)}", alert=True)
 
 @dp.callback_query(F.data == "action:history")
 async def cb_history(cb: CallbackQuery):
+    await ack(cb)
     history = await get_history(cb.message.chat.id)
     if not history:
         text = "📜 История поливов пуста"
     else:
         lines = ["📜 *Последние поливы:*", ""]
         for r in history:
-            d = date.fromisoformat(r['watered_at']).strftime("%-d %b").lower()
+            d = fmt_day(date.fromisoformat(r['watered_at']))
             lines.append(f"{r['emoji']} {r['name']} — {d} ({r['watered_by']})")
         text = "\n".join(lines)
-    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=back_kb())
-    await cb.answer()
+    await safe_edit(cb, text, back_kb())
 
 @dp.callback_query(F.data == "action:stats")
 async def cb_stats(cb: CallbackQuery):
+    await ack(cb)
     stats = await get_stats(cb.message.chat.id)
     if not stats:
         text = "📊 Статистика пуста"
@@ -305,31 +363,30 @@ async def cb_stats(cb: CallbackQuery):
         for r in stats:
             lines.append(f"{r['emoji']} {r['name']} — {r['cnt']} раз")
         text = "\n".join(lines)
-    await cb.message.edit_text(text, parse_mode="Markdown", reply_markup=back_kb())
-    await cb.answer()
+    await safe_edit(cb, text, back_kb())
 
 @dp.callback_query(F.data == "action:delete")
 async def cb_delete_list(cb: CallbackQuery):
     plants = await get_plants(cb.message.chat.id)
     if not plants:
-        await cb.answer("Нет растений!", show_alert=True)
+        await ack(cb, "Нет растений!", alert=True)
         return
-    await cb.message.edit_text("🗑 *Выбери растение для удаления:*", parse_mode="Markdown",
-                                reply_markup=plants_delete_kb(plants))
-    await cb.answer()
+    await ack(cb)
+    await safe_edit(cb, "🗑 *Выбери растение для удаления:*", plants_delete_kb(plants))
 
 @dp.callback_query(F.data.startswith("confirmdelete:"))
 async def cb_confirm_delete(cb: CallbackQuery):
     plant_id = int(cb.data.split(":")[1])
     plant = await get_plant(plant_id)
     if not plant:
-        await cb.answer("Не найдено", show_alert=True)
+        await ack(cb, "Не найдено", alert=True)
         return
-    await cb.message.edit_text(
+    await ack(cb)
+    await safe_edit(
+        cb,
         f"Удалить {plant['emoji']} *{plant['name']}*?\nВся история тоже удалится.",
-        parse_mode="Markdown", reply_markup=confirm_delete_kb(plant_id)
+        confirm_delete_kb(plant_id)
     )
-    await cb.answer()
 
 @dp.callback_query(F.data.startswith("dodelete:"))
 async def cb_do_delete(cb: CallbackQuery):
@@ -338,17 +395,17 @@ async def cb_do_delete(cb: CallbackQuery):
     name = plant['name'] if plant else "растение"
     emoji = plant['emoji'] if plant else "🌱"
     await delete_plant(plant_id)
+    await ack(cb, f"🗑 {emoji} {name} удалён")
     plants = await get_plants(cb.message.chat.id)
-    await cb.message.edit_text(build_status_text(plants), parse_mode="Markdown", reply_markup=main_kb())
-    await cb.answer(f"🗑 {emoji} {name} удалён")
+    await safe_edit(cb, build_status_text(plants), main_kb())
 
 # ─── Add plant flow ───────────────────────────────────────────────
 @dp.callback_query(F.data == "action:add")
 async def cb_add_start(cb: CallbackQuery):
+    await ack(cb)
     key = (cb.message.chat.id, cb.from_user.id)
     add_state[key] = {"step": "name", "chat_id": cb.message.chat.id}
-    await cb.message.edit_text("➕ *Добавляем растение*\n\nШаг 1/4: Напиши *название* растения", parse_mode="Markdown")
-    await cb.answer()
+    await safe_edit(cb, "➕ *Добавляем растение*\n\nШаг 1/4: Напиши *название* растения")
 
 @dp.message(F.text)
 async def handle_text(msg: types.Message):
@@ -391,11 +448,32 @@ async def handle_text(msg: types.Message):
             parse_mode="Markdown", reply_markup=main_kb()
         )
 
+# ─── Global error handler ─────────────────────────────────────────
+@dp.errors()
+async def on_error(event: ErrorEvent):
+    """Ни одно исключение не должно оставлять кнопку в «часиках» молча."""
+    logging.exception(f"Ошибка при обработке апдейта: {event.exception}")
+    cb = event.update.callback_query
+    if cb is not None:
+        try:
+            await cb.answer("⚠️ Ошибка, попробуй ещё раз или /menu", show_alert=True)
+        except Exception:
+            pass
+    return True
+
 # ─── Daily reminder ───────────────────────────────────────────────
 async def daily_check():
-    chats = await get_all_chats()
+    try:
+        chats = await get_all_chats()
+    except Exception as e:
+        logging.exception(f"daily_check: не смог прочитать чаты: {e}")
+        return
     for chat_id in chats:
-        plants = await get_plants(chat_id)
+        try:
+            plants = await get_plants(chat_id)
+        except Exception as e:
+            logging.exception(f"daily_check: не смог прочитать растения {chat_id}: {e}")
+            continue
         due = []
         for p in plants:
             days = days_until_next(p['last_watered'], p['interval_days'])
@@ -414,6 +492,14 @@ async def daily_check():
 # ─── Main ─────────────────────────────────────────────────────────
 async def main():
     await init_db()
+    logging.info("БД готова")
+
+    # если когда-то был выставлен webhook, getUpdates не получит ни одного апдейта
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    me = await bot.get_me()
+    logging.info(f"Запускаю polling для @{me.username} (id={me.id})")
+
     scheduler.add_job(daily_check, "cron", hour=9, minute=0)
     scheduler.start()
     await dp.start_polling(bot)
